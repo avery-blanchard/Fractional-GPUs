@@ -19,6 +19,8 @@
  * Check what happens currently.
  */
 
+#include <memory.h>
+
 #include <assert.h>
 #include <dlfcn.h>
 #include <errno.h>
@@ -76,8 +78,6 @@ orig_connect_f_type g_orig_connect;
 pthread_once_t g_pre_init_once = PTHREAD_ONCE_INIT;
 pthread_once_t g_post_init_once = PTHREAD_ONCE_INIT;
 bool g_init_failed;
-
-/* All information needed for tracking memory */
 struct {
     bool is_initialized;
 
@@ -123,6 +123,7 @@ static void post_initialization(void)
     }
 }
 
+
 /* Does the initialization atmost once */
 static int init(bool do_post_init)
 {
@@ -147,6 +148,15 @@ static int init(bool do_post_init)
     if (g_init_failed) {
         fprintf(stderr, "FGPU:Initialization failed\n");
         return -EINVAL;
+    }
+
+    for (int i = 0; i < MAX_COLORS; i++) {
+        color_assignments[i] = 0;
+    }
+
+    for (int i = 0; i < MAX_COLORS; i++) {
+        allocations[i].ptr = NULL; 
+        allocations[i].color = -1;
     }
 
     return 0;
@@ -510,6 +520,55 @@ void *fgpu_memory_get_phy_address(void *addr)
 
 #else /* FGPU_MEM_COLORING_ENABLED */
 
+int find_allocation_index(void *p) {
+    for (int i = 0; i < MAX_COLORS; i++) {
+        if (allocations[i].ptr == p) {
+            return i;
+        }
+    }
+    return -1;  // Not found
+}
+
+int fgpu_memory_allocate_colored(void **p, size_t len, int color)
+{
+    printf("Checkpoint 1");
+    if (color < 0 || color >= MAX_COLORS || color_assignments[color] >= 1) {
+        return -1; /* Color is invalid or taken */
+    }
+    
+    printf("Checkpoint 2");
+    /* Allocate memory on GPU */
+    int ret = gpuErrCheck(cudaMallocManaged(p, len));
+    if (ret < 0) {
+        return ret;
+    }
+
+    printf("Checkpoint 3");
+    /* Prefetch the memory to GPU */
+    ret = gpuErrCheck(cudaMemPrefetchAsync(*p, len, FGPU_DEVICE_NUMBER));
+    if (ret < 0) {
+        cudaFree(p);
+        return ret;
+    }
+
+    printf("Checkpoint 4");
+    /* Find an empty allocation slot */
+    int idx = find_allocation_index(NULL);
+    if (idx == -1) {
+        cudaFree(p);
+        fprintf(stderr, "Error: Out of allocation slots\n");
+        return -1;
+    }
+
+    printf("Checkpoint 5");
+    /* Record the allocation */
+    allocations[idx].ptr = *p;
+    allocations[idx].color = color;
+    color_assignments[color]++;  // Mark the color as taken
+
+    return gpuErrCheck(cudaDeviceSynchronize());
+}
+
 int fgpu_memory_allocate(void **p, size_t len)
 {
     /*
@@ -520,25 +579,43 @@ int fgpu_memory_allocate(void **p, size_t len)
      * This we suspect is because of code difference inside the Linux driver
      */
     int ret;
-    
-    ret = gpuErrCheck(cudaMallocManaged(p, len));
-    if (ret < 0)
-        return ret;
-
-    /* Do the actual allocation on device */
-    ret = gpuErrCheck(cudaMemPrefetchAsync(*p, len, FGPU_DEVICE_NUMBER));
-    if (ret < 0) {
-        cudaFree(p);
-        return ret;
+    for (int i = 0; i < MAX_COLORS; i++) {
+        ret = fgpu_memory_allocate_colored(p, len, i); 
+        if (ret == 0) { /* Found a color */
+            return 0;
+        }
     }
-
-    return gpuErrCheck(cudaDeviceSynchronize());
+    return -1; /* Return error if all colors are taken */
 }
 
 int fgpu_memory_free(void *p)
 {
-    return gpuErrCheck(cudaFree(p));
+    int idx = find_allocation_index(p);
+    if (idx == -1) {
+        fprintf(stderr, "Error: Pointer not found in allocation records\n");
+        return -1;
+    }
+
+    int color = allocations[idx].color;
+    if (color > 0 && color < MAX_COLORS) {
+        color_assignments[color] = 0;  /* Remove the color assignment */
+    }
+    else {
+        fprintf(stderr, "Error: Invalid color assignment\n");
+        return -1;
+    }
+
+    cudaFree(p);  /* Actual call to cude memory free */
+
+    // Clear the allocation record
+    allocations[idx].ptr = NULL;
+    allocations[idx].color = -1;
+
+    return gpuErrCheck(cudaDeviceSynchronize());
 }
+
+
+
 
 void *fgpu_memory_get_phy_address(void *addr)
 {
